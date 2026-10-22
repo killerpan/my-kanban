@@ -1,0 +1,14 @@
+services:
+  kanban:
+    build: .
+    image: kanban-intranet:1.0.0
+    container_name: kanban
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8080:3000"
+    volumes:
+      - kanban-data:/data
+
+volumes:
+  kanban-data:

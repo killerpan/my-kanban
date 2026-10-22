@@ -2,10 +2,18 @@
 
 const state = {
   me: null,
+  config: { ldap: false },
   board: null,        // datos del tablero abierto
   dragCardId: null,
   pollTimer: null,
+  stream: null,       // EventSource del tablero abierto
+  live: 'connecting', // 'connecting' | 'on' | 'off'
+  stale: false,       // llegaron cambios mientras había un modal abierto
+  openCard: null,     // { id, reloadActivity } de la tarjeta abierta en el modal
 };
+
+// Identifica esta pestaña para no recargar los cambios que ella misma hizo.
+const TAB_ID = Math.random().toString(36).slice(2) + Date.now().toString(36);
 
 const $app = document.getElementById('app');
 const ROLE_LABEL = { owner: 'Dueño', editor: 'Editor', viewer: 'Lector' };
@@ -18,7 +26,7 @@ const COLORS = [
   { id: 'purple', label: 'Morado' },
   { id: 'gray', label: 'Gris' },
 ];
-const POLL_MS = 10000;
+const POLL_MS = 60000; // respaldo si el canal en vivo se corta
 
 // ---------- utilidades ----------
 
@@ -46,7 +54,7 @@ async function api(method, url, body) {
   const res = await fetch(url, {
     method,
     credentials: 'same-origin',
-    headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'kanban' },
+    headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'kanban', 'X-Client-Id': TAB_ID },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   let data = null;
@@ -58,7 +66,7 @@ async function api(method, url, body) {
     renderLogin(data?.error);
     throw new Error(data?.error || 'Sesión expirada');
   }
-  if (!res.ok) throw new Error(data?.error || `Error ${res.status}`);
+  if (!res.ok) throw Object.assign(new Error(data?.error || `Error ${res.status}`), { status: res.status });
   return data;
 }
 
@@ -90,6 +98,24 @@ function dueState(iso) {
   if (diff < 0) return 'late';
   if (diff <= 2) return 'soon';
   return '';
+}
+
+function parseUTC(sqlite) {
+  return new Date(sqlite.replace(' ', 'T') + 'Z');
+}
+
+const rtf = new Intl.RelativeTimeFormat('es', { numeric: 'auto' });
+function timeAgo(sqlite) {
+  const d = parseUTC(sqlite);
+  const sec = Math.round((d - Date.now()) / 1000);
+  if (Math.abs(sec) < 45) return 'recién';
+  const min = Math.round(sec / 60);
+  if (Math.abs(min) < 60) return rtf.format(min, 'minute');
+  const hrs = Math.round(min / 60);
+  if (Math.abs(hrs) < 24) return rtf.format(hrs, 'hour');
+  const days = Math.round(hrs / 24);
+  if (Math.abs(days) < 7) return rtf.format(days, 'day');
+  return d.toLocaleDateString('es-CL', { day: 'numeric', month: 'short', year: d.getFullYear() !== new Date().getFullYear() ? 'numeric' : undefined });
 }
 
 function canEdit() { return ['owner', 'editor'].includes(state.board?.my_role); }
@@ -125,6 +151,11 @@ function openModal({ title, body, footer, wide }) {
 
 function closeModal() {
   if (modalCleanup) { const c = modalCleanup; modalCleanup = null; c(); }
+  state.openCard = null;
+  if (state.stale && state.board && $app.querySelector('.board-page')) {
+    state.stale = false;
+    refreshBoard(true);
+  }
 }
 
 function field(label, control) {
@@ -145,7 +176,7 @@ function topbar(active) {
     h('div', { class: 'user' },
       h('span', { class: 'avatar', 'aria-hidden': 'true' }, initials(me.display_name)),
       h('span', { class: 'name' }, me.display_name),
-      h('button', { class: 'btn ghost small', onClick: openPasswordModal }, 'Contraseña'),
+      me.auth_source === 'local' ? h('button', { class: 'btn ghost small', onClick: openPasswordModal }, 'Contraseña') : null,
       h('button', { class: 'btn ghost small', onClick: logout }, 'Salir')));
 }
 
@@ -155,6 +186,7 @@ function mount(active, ...content) {
 
 function route() {
   stopPolling();
+  state.stale = false;
   closeModal();
   if (!state.me) return renderLogin();
   const hash = location.hash || '#/';
@@ -195,8 +227,9 @@ function renderLogin(message) {
     } finally { submit.disabled = false; }
   } },
     h('div', { class: 'brand' }, h('span', { class: 'brand-mark', 'aria-hidden': 'true' }, h('i'), h('i'), h('i')), 'Tablero'),
-    field('Usuario', user),
+    field(state.config.ldap ? 'Usuario de red' : 'Usuario', user),
     field('Contraseña', pass),
+    state.config.ldap ? h('p', { class: 'muted', style: 'font-size:.85rem' }, 'Usa el mismo usuario y contraseña con que inicias sesión en tu computador.') : null,
     err,
     submit);
 
@@ -306,6 +339,7 @@ async function renderBoard(id) {
   }
   drawBoard();
   startPolling(id);
+  connectStream(id);
 }
 
 function drawBoard() {
@@ -320,6 +354,7 @@ function drawBoard() {
       h('div', { class: 'row' }, h('h1', {}, board.name), h('span', { class: `role-tag ${my_role}` }, ROLE_LABEL[my_role])),
       board.description ? h('p', { class: 'desc' }, board.description) : null),
     h('div', { class: 'row' },
+      liveBadge(),
       h('button', { class: 'btn', onClick: openMembers }, isOwner() ? 'Miembros' : `${state.board.members.length} miembros`),
       isOwner() ? h('button', { class: 'btn', onClick: openBoardSettings }, 'Ajustes') : null));
 
@@ -363,9 +398,10 @@ function drawCard(card) {
     onKeydown: (e) => { if (e.key === 'Enter') openCard(card.id); },
   },
     h('div', { class: 'title' }, card.title),
-    (card.due_date || card.assignee_name || card.description)
+    (card.due_date || card.assignee_name || card.description || card.comment_count)
       ? h('div', { class: 'foot' },
         card.description ? h('span', { class: 'has-desc', title: 'Tiene descripción' }) : null,
+        card.comment_count ? h('span', { class: 'comment-count', title: `${card.comment_count} ${card.comment_count === 1 ? 'comentario' : 'comentarios'}` }, card.comment_count) : null,
         card.due_date ? h('span', { class: `due ${due}`, title: `Vence: ${card.due_date}` }, fmtDate(card.due_date)) : null,
         card.assignee_name ? h('span', { class: 'avatar', title: card.assignee_name }, initials(card.assignee_name)) : null)
       : null);
@@ -382,6 +418,7 @@ function drawCard(card) {
       el.classList.remove('dragging');
       document.querySelectorAll('.drop-marker').forEach((m) => m.remove());
       document.querySelectorAll('.drag-over').forEach((m) => m.classList.remove('drag-over'));
+      setTimeout(flushStale, 300); // después de que el movimiento propio se confirme
     });
   }
   return el;
@@ -448,8 +485,10 @@ async function moveCard(cardId, columnId, index) {
 
 function drawAddCard(col) {
   const box = h('div', { class: 'add-card' });
-  const showButton = () => box.replaceChildren(
-    h('button', { class: 'btn ghost', onClick: showForm }, '+ Añadir tarjeta'));
+  const showButton = () => {
+    box.replaceChildren(h('button', { class: 'btn ghost', onClick: showForm }, '+ Añadir tarjeta'));
+    flushStale();
+  };
   const showForm = () => {
     const input = h('textarea', { rows: '2', maxlength: '200', placeholder: 'Título de la tarjeta', style: 'min-height:auto' });
     const submit = async () => {
@@ -496,28 +535,116 @@ function drawAddLane() {
 
 // ---------- modal de tarjeta ----------
 
+const COLOR_LABEL = Object.fromEntries(COLORS.map((c) => [c.id, c.label.toLowerCase()]));
+
+function eventText(e) {
+  const d = e.data || {};
+  switch (e.type) {
+    case 'created': return `creó la tarjeta en ${d.column}`;
+    case 'moved': return `movió la tarjeta de ${d.from} a ${d.to}`;
+    case 'title': return `cambió el título de «${d.from}» a «${d.to}»`;
+    case 'description': return 'editó la descripción';
+    case 'color': return d.to ? `cambió el color a ${COLOR_LABEL[d.to] || d.to}` : 'quitó el color';
+    case 'due': return d.to ? `puso fecha límite el ${fmtDate(d.to)}` : 'quitó la fecha límite';
+    case 'assignee': return d.to ? `asignó la tarjeta a ${d.to}` : 'quitó la asignación';
+    default: return 'modificó la tarjeta';
+  }
+}
+
+/** Sección de comentarios + historial. Todos los miembros, incluso lectores, pueden comentar. */
+function buildActivity(card) {
+  const feed = h('div', { class: 'feed' }, h('p', { class: 'muted' }, 'Cargando actividad…'));
+  const input = h('textarea', { rows: '2', maxlength: '2000', placeholder: 'Escribe un comentario…', 'aria-label': 'Nuevo comentario' });
+  const err = h('p', { class: 'error-text' });
+  let sending = false;
+
+  const load = async () => {
+    let data;
+    try { data = await api('GET', `/api/cards/${card.id}/activity`); } catch (e) {
+      feed.replaceChildren(h('p', { class: 'error-text' }, e.status === 404 ? 'Esta tarjeta fue eliminada.' : e.message));
+      return;
+    }
+    card.comment_count = data.comments.length;
+    const items = [
+      ...data.comments.map((c) => ({ kind: 'comment', ...c })),
+      ...data.events.map((e) => ({ kind: 'event', ...e })),
+    ].sort((x, y) => y.created_at.localeCompare(x.created_at) || (y.kind === 'comment') - (x.kind === 'comment') || y.id - x.id);
+
+    feed.replaceChildren(...items.map((it) => {
+      const when = h('time', { datetime: parseUTC(it.created_at).toISOString(), title: parseUTC(it.created_at).toLocaleString('es-CL') }, timeAgo(it.created_at));
+      const who = it.user_name || 'Alguien';
+      if (it.kind === 'event') {
+        return h('div', { class: 'event' }, h('span', {}, h('b', {}, who), ' ', eventText(it)), when);
+      }
+      const mine = it.user_id === state.me.id;
+      return h('article', { class: 'comment' },
+        h('div', { class: 'comment-head' },
+          h('span', { class: 'avatar', 'aria-hidden': 'true' }, initials(who)),
+          h('b', {}, who), when,
+          (mine || isOwner()) ? h('button', {
+            class: 'btn ghost small', 'aria-label': 'Borrar comentario',
+            onClick: async () => {
+              if (!confirm('¿Borrar este comentario?')) return;
+              try { await api('DELETE', `/api/comments/${it.id}`); state.stale = true; await load(); } catch (e) { err.textContent = e.message; }
+            },
+          }, 'Borrar') : null),
+        h('p', { class: 'comment-body' }, it.body));
+    }));
+    if (!items.length) feed.replaceChildren(h('p', { class: 'muted' }, 'Sin actividad todavía.'));
+  };
+
+  const send = async () => {
+    const body = input.value.trim();
+    if (!body || sending) return;
+    sending = true; err.textContent = '';
+    try {
+      await api('POST', `/api/cards/${card.id}/comments`, { body });
+      input.value = '';
+      state.stale = true; // el contador de la tarjeta se actualiza al cerrar el modal
+      await load();
+    } catch (e) { err.textContent = e.message; } finally { sending = false; }
+  };
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send(); }
+  });
+
+  const node = h('section', { class: 'activity', 'aria-label': 'Actividad' },
+    h('h3', {}, 'Actividad'),
+    h('div', { class: 'comment-box' },
+      input,
+      h('div', { class: 'row' },
+        h('span', { class: 'muted grow hint' }, 'Ctrl + Enter para enviar'),
+        h('button', { class: 'btn primary small', type: 'button', onClick: send }, 'Comentar'))),
+    err,
+    feed);
+  load();
+  return { node, load };
+}
+
 function openCard(cardId) {
   const card = state.board.cards.find((c) => c.id === cardId);
   if (!card) return;
   const { columns, members } = state.board;
   const columnName = columns.find((c) => c.id === card.column_id)?.name;
+  const activity = buildActivity(card);
 
   if (!canEdit()) {
     openModal({
       title: card.title,
-      body: h('div', { class: 'field' },
-        h('p', { class: 'muted' }, `En ${columnName}`),
+      wide: true,
+      body: h('div', { class: 'field', style: 'gap:.85rem' },
+        h('p', { class: 'muted' }, `En ${columnName} · Asignada a ${card.assignee_name || 'nadie'}${card.due_date ? ` · Vence ${fmtDate(card.due_date)}` : ''}`),
         card.description ? h('p', { style: 'white-space:pre-wrap' }, card.description) : h('p', { class: 'muted' }, 'Sin descripción.'),
-        h('p', {}, `Asignada a: ${card.assignee_name || 'nadie'}`),
-        card.due_date ? h('p', {}, `Vence: ${fmtDate(card.due_date)}`) : null),
+        activity.node),
       footer: [h('button', { class: 'btn', onClick: closeModal }, 'Cerrar')],
     });
+    state.openCard = { id: card.id, reloadActivity: activity.load };
     return;
   }
 
   let color = card.color || '';
   const title = h('input', { type: 'text', maxlength: '200', value: card.title });
-  const desc = h('textarea', { maxlength: '5000', rows: '6', value: card.description });
+  const desc = h('textarea', { maxlength: '5000', rows: '5', value: card.description });
   const column = h('select', {}, columns.map((c) => h('option', { value: c.id, selected: c.id === card.column_id }, c.name)));
   const assignee = h('select', {},
     h('option', { value: '' }, 'Sin asignar'),
@@ -531,7 +658,7 @@ function openCard(cardId) {
       title: c.label, 'aria-label': c.label, 'aria-pressed': String(c.id === color),
       onClick: (e) => {
         color = c.id;
-        swatches.querySelectorAll('.swatch').forEach((s) => s.setAttribute('aria-pressed', 'false'));
+        swatches.querySelectorAll('.swatch').forEach((sw) => sw.setAttribute('aria-pressed', 'false'));
         e.currentTarget.setAttribute('aria-pressed', 'true');
       },
     })));
@@ -556,7 +683,7 @@ function openCard(cardId) {
   };
 
   const remove = async () => {
-    if (!confirm(`¿Eliminar la tarjeta "${card.title}"? No se puede deshacer.`)) return;
+    if (!confirm(`¿Eliminar la tarjeta "${card.title}"? Se borran también sus comentarios e historial.`)) return;
     try {
       await api('DELETE', `/api/cards/${card.id}`);
       state.board.cards = state.board.cards.filter((c) => c.id !== card.id);
@@ -568,6 +695,7 @@ function openCard(cardId) {
 
   openModal({
     title: 'Editar tarjeta',
+    wide: true,
     body: h('div', { class: 'field', style: 'gap:.85rem' },
       field('Título', title),
       field('Descripción', desc),
@@ -576,13 +704,14 @@ function openCard(cardId) {
         field('Asignada a', assignee),
         field('Fecha límite', due),
         h('div', { class: 'field' }, h('span', {}, 'Color'), swatches)),
-      err),
-    footer: [
-      h('button', { class: 'btn danger left', onClick: remove }, 'Eliminar'),
-      h('button', { class: 'btn', onClick: closeModal }, 'Cancelar'),
-      h('button', { class: 'btn primary', onClick: save }, 'Guardar cambios'),
-    ],
+      err,
+      h('div', { class: 'modal-foot' },
+        h('button', { class: 'btn danger left', onClick: remove }, 'Eliminar'),
+        h('button', { class: 'btn', onClick: closeModal }, 'Cancelar'),
+        h('button', { class: 'btn primary', onClick: save }, 'Guardar cambios')),
+      activity.node),
   });
+  state.openCard = { id: card.id, reloadActivity: activity.load };
 }
 
 // ---------- columnas ----------
@@ -698,7 +827,7 @@ async function openMembers() {
   openModal({
     title: 'Miembros del tablero',
     body: h('div', { class: 'field', style: 'gap:1rem' },
-      owner ? h('p', { class: 'muted' }, 'Dueño: administra miembros y ajustes. Editor: crea y mueve tarjetas y columnas. Lector: solo mira.') : null,
+      owner ? h('p', { class: 'muted' }, 'Dueño: administra miembros y ajustes. Editor: crea, edita y mueve tarjetas y columnas. Lector: mira y comenta.') : null,
       list,
       owner ? h('div', { class: 'panel' }, h('h3', {}, 'Agregar persona'), addRow) : null,
       err),
@@ -745,31 +874,126 @@ function openBoardSettings() {
   });
 }
 
-// ---------- sincronización ----------
+// ---------- sincronización en vivo ----------
+
+const LIVE_TEXT = {
+  connecting: ['Conectando…', 'Abriendo conexión en vivo.'],
+  on: ['En vivo', 'Los cambios de otras personas aparecen al instante.'],
+  off: ['Reconectando…', 'Se perdió la conexión en vivo; reintentando.'],
+};
+
+function liveBadge() {
+  const [label, title] = LIVE_TEXT[state.live];
+  return h('span', { class: `live ${state.live}`, title }, label);
+}
+
+function setLive(value) {
+  if (state.live === value) return;
+  state.live = value;
+  document.querySelector('.live')?.replaceWith(liveBadge());
+}
 
 async function refreshBoard(force = false) {
   if (!state.board) return;
   const id = state.board.board.id;
   const typing = document.activeElement?.closest?.('.lanes form');
-  if (!force && (state.dragCardId || modalCleanup || typing)) return;
+  if (!force && (state.dragCardId || modalCleanup || typing)) { state.stale = true; return; }
   const before = JSON.stringify(state.board);
   try { await loadBoard(id); } catch (e) {
-    if (e.message !== 'Sesión expirada') { toast(e.message, 'error'); location.hash = '#/'; }
-    return;
+    if (e.status === 404 || e.status === 403) {
+      closeStream();
+      closeModal();
+      toast('Ya no tienes acceso a este tablero.', 'error');
+      location.hash = '#/';
+    }
+    return; // errores de red: se reintenta en el próximo aviso o consulta
   }
+  state.stale = false;
   if (force || JSON.stringify(state.board) !== before) drawBoard();
+}
+
+/** Si quedaron cambios pendientes mientras se arrastraba o escribía, aplícalos ahora. */
+function flushStale() {
+  if (state.stale) refreshBoard();
+}
+
+let refreshTimer = null;
+function onRemoteChange(ev) {
+  if (state.openCard && ev.card_id === state.openCard.id) state.openCard.reloadActivity();
+  clearTimeout(refreshTimer);
+  refreshTimer = setTimeout(() => refreshBoard(), 150); // agrupa ráfagas de cambios
+}
+
+function closeStream() {
+  if (state.stream) state.stream.close();
+  state.stream = null;
+  state.live = 'connecting';
+}
+
+function connectStream(boardId) {
+  closeStream();
+  if (!window.EventSource) { setLive('off'); return; }
+  const es = new EventSource(`/api/boards/${boardId}/stream`);
+  state.stream = es;
+  let connectedBefore = false;
+
+  es.addEventListener('ready', () => {
+    setLive('on');
+    if (connectedBefore) refreshBoard(); // recupera lo que pasó mientras estuvo desconectado
+    connectedBefore = true;
+  });
+  es.onmessage = (e) => {
+    let ev;
+    try { ev = JSON.parse(e.data); } catch { return; }
+    if (ev.origin === TAB_ID) return;
+    onRemoteChange(ev);
+  };
+  es.addEventListener('deleted', (e) => {
+    let origin = null;
+    try { ({ origin } = JSON.parse(e.data)); } catch { /* sin datos */ }
+    closeStream();
+    if (origin !== TAB_ID) {
+      closeModal();
+      toast('Este tablero fue eliminado.', 'error');
+      location.hash = '#/';
+    }
+  });
+  es.addEventListener('revoked', () => {
+    // Quitaron el acceso, desactivaron la cuenta o venció la sesión: la API dirá cuál.
+    closeStream();
+    refreshBoard(true);
+  });
+  es.onerror = () => {
+    if (state.stream !== es) return;
+    setLive('off');
+    // CLOSED = el servidor rechazó la conexión (no reintenta solo). CONNECTING = reintento automático.
+    if (es.readyState === EventSource.CLOSED) {
+      state.stream = null;
+      setTimeout(async () => {
+        if (state.board?.board.id !== boardId || !$app.querySelector('.board-page') || state.stream) return;
+        try {
+          await api('GET', '/api/auth/me'); // si la sesión venció, api() lleva al login
+          connectStream(boardId);
+        } catch { /* el login ya se mostró o el servidor sigue caído; la consulta periódica reintenta */ }
+      }, 5000);
+    }
+  };
 }
 
 function startPolling() {
   stopPolling();
   state.pollTimer = setInterval(() => {
-    if (document.visibilityState === 'visible') refreshBoard();
+    if (document.visibilityState !== 'visible') return;
+    refreshBoard();
+    // Si el canal en vivo quedó cerrado, intenta abrirlo de nuevo.
+    if (!state.stream && state.board && $app.querySelector('.board-page')) connectStream(state.board.board.id);
   }, POLL_MS);
 }
 
 function stopPolling() {
   if (state.pollTimer) clearInterval(state.pollTimer);
   state.pollTimer = null;
+  closeStream();
 }
 
 document.addEventListener('visibilitychange', () => {
@@ -786,17 +1010,20 @@ async function renderUsers() {
   try { ({ users } = await api('GET', '/api/users')); } catch (e) { return fail(e); }
 
   const table = h('div', { class: 'table-wrap' }, h('table', {},
-    h('thead', {}, h('tr', {}, h('th', {}, 'Nombre'), h('th', {}, 'Usuario'), h('th', {}, 'Rol'), h('th', {}, 'Estado'), h('th', {}, ''))),
+    h('thead', {}, h('tr', {}, h('th', {}, 'Nombre'), h('th', {}, 'Usuario'), h('th', {}, 'Acceso'), h('th', {}, 'Rol'), h('th', {}, 'Estado'), h('th', {}, ''))),
     h('tbody', {}, users.map((u) => h('tr', { class: u.active ? '' : 'inactive' },
       h('td', {}, h('div', { class: 'row' }, h('span', { class: 'avatar', 'aria-hidden': 'true' }, initials(u.display_name)), u.display_name)),
       h('td', {}, u.username),
+      h('td', {}, u.auth_source === 'ldap' ? 'Cuenta de red' : 'Local'),
       h('td', {}, u.role === 'admin' ? 'Administrador' : 'Usuario'),
       h('td', {}, h('span', { class: 'status-dot' }), u.active ? 'Activo' : 'Desactivado'),
       h('td', { style: 'text-align:right' }, h('button', { class: 'btn small', onClick: () => openUser(u) }, 'Editar')))))));
 
   page.replaceChildren(
     h('div', { class: 'page-head' },
-      h('div', {}, h('h1', {}, 'Usuarios'), h('p', { class: 'muted' }, 'Solo los administradores crean cuentas. Desactivar una cuenta cierra sus sesiones.')),
+      h('div', {}, h('h1', {}, 'Usuarios'), h('p', { class: 'muted' }, state.config.ldap
+        ? 'Las cuentas de red se crean solas en su primer ingreso. Desactivar una cuenta cierra sus sesiones.'
+        : 'Solo los administradores crean cuentas. Desactivar una cuenta cierra sus sesiones.')),
       h('button', { class: 'btn primary', onClick: () => openUser(null) }, 'Crear usuario')),
     table);
 }
@@ -808,19 +1035,32 @@ function openUser(u) {
   const role = h('select', {},
     h('option', { value: 'user', selected: u?.role !== 'admin' }, 'Usuario'),
     h('option', { value: 'admin', selected: u?.role === 'admin' }, 'Administrador'));
+  const source = h('select', {},
+    h('option', { value: 'ldap', selected: isNew ? true : u.auth_source === 'ldap' }, 'Cuenta de red'),
+    h('option', { value: 'local', selected: !isNew && u.auth_source === 'local' }, 'Cuenta local'));
   const password = h('input', { type: 'password', autocomplete: 'new-password', placeholder: isNew ? '' : 'Déjala vacía para no cambiarla' });
+  const passwordField = field(isNew ? 'Contraseña (mínimo 8 caracteres)' : 'Nueva contraseña', password);
+  const ldapNote = h('p', { class: 'muted' }, 'Usa su usuario y contraseña de red. Escribe el usuario tal como en el directorio (por ejemplo, jperez).');
   const active = h('input', { type: 'checkbox', checked: u ? u.active : true });
   const err = h('p', { class: 'error-text' });
+
+  const isLdap = () => (isNew ? state.config.ldap && source.value === 'ldap' : u.auth_source === 'ldap');
+  const syncSource = () => { passwordField.hidden = isLdap(); ldapNote.hidden = !isLdap(); };
+  source.addEventListener('change', syncSource);
 
   const save = async () => {
     err.textContent = '';
     try {
       if (isNew) {
-        await api('POST', '/api/users', { username: username.value, display_name: display.value, password: password.value, role: role.value });
+        await api('POST', '/api/users', {
+          username: username.value, display_name: display.value, role: role.value,
+          auth_source: isLdap() ? 'ldap' : 'local',
+          password: isLdap() ? undefined : password.value,
+        });
         toast('Usuario creado.');
       } else {
         const body = { display_name: display.value, role: role.value, active: active.checked };
-        if (password.value) body.password = password.value;
+        if (password.value && !isLdap()) body.password = password.value;
         await api('PATCH', `/api/users/${u.id}`, body);
         toast('Cambios guardados.');
         if (u.id === state.me.id) state.me = (await api('GET', '/api/auth/me')).user;
@@ -833,10 +1073,10 @@ function openUser(u) {
   openModal({
     title: isNew ? 'Crear usuario' : `Editar a ${u.display_name}`,
     body: h('form', { class: 'field', style: 'gap:.85rem', onSubmit: (e) => { e.preventDefault(); save(); } },
+      isNew && state.config.ldap ? field('Tipo de cuenta', source) : null,
       h('div', { class: 'grid-2' }, field('Usuario', username), field('Nombre visible', display)),
-      h('div', { class: 'grid-2' },
-        field('Rol', role),
-        field(isNew ? 'Contraseña (mínimo 8 caracteres)' : 'Nueva contraseña', password)),
+      h('div', { class: 'grid-2' }, field('Rol', role), passwordField),
+      ldapNote,
       isNew ? null : h('label', { class: 'row' }, active, 'Cuenta activa'),
       err,
       h('button', { type: 'submit', hidden: true })),
@@ -845,11 +1085,13 @@ function openUser(u) {
       h('button', { class: 'btn primary', onClick: save }, isNew ? 'Crear usuario' : 'Guardar cambios'),
     ],
   });
+  syncSource();
 }
 
 // ---------- arranque ----------
 
 (async function boot() {
+  try { state.config = await api('GET', '/api/auth/config'); } catch { /* usa valores por defecto */ }
   try {
     const { user } = await api('GET', '/api/auth/me');
     state.me = user;

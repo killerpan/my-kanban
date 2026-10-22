@@ -67,6 +67,46 @@ CREATE INDEX IF NOT EXISTS idx_cards_column  ON cards(column_id, position);
 CREATE INDEX IF NOT EXISTS idx_members_user  ON board_members(user_id);
 `);
 
+// ---------- migraciones (PRAGMA user_version) ----------
+// Cada entrada se aplica una sola vez, en orden. Así una base existente se actualiza al arrancar.
+const migrations = [
+  // 1: origen de la cuenta (local o directorio), comentarios e historial de tarjetas
+  () => {
+    const cols = db.prepare('PRAGMA table_info(users)').all().map((c) => c.name);
+    if (!cols.includes('auth_source')) {
+      db.exec(`ALTER TABLE users ADD COLUMN auth_source TEXT NOT NULL DEFAULT 'local' CHECK (auth_source IN ('local','ldap'))`);
+    }
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS card_comments (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        card_id    INTEGER NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+        user_id    INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        body       TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE TABLE IF NOT EXISTS card_events (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        card_id    INTEGER NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+        user_id    INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        type       TEXT NOT NULL,
+        data       TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_comments_card ON card_comments(card_id, id);
+      CREATE INDEX IF NOT EXISTS idx_events_card   ON card_events(card_id, id);
+    `);
+  },
+];
+
+const current = db.pragma('user_version', { simple: true });
+for (let v = current; v < migrations.length; v++) {
+  db.transaction(() => {
+    migrations[v]();
+    db.pragma(`user_version = ${v + 1}`);
+  })();
+  console.log(`Migración aplicada: v${v + 1}`);
+}
+
 /** Crea el primer administrador si la base está vacía. */
 function seedAdmin() {
   const count = db.prepare('SELECT COUNT(*) AS n FROM users').get().n;

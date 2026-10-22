@@ -2,6 +2,7 @@ const express = require('express');
 const bcrypt = require('bcryptjs');
 const { db } = require('./db');
 const { requireAdmin, publicUser } = require('./auth');
+const realtime = require('./realtime');
 
 const router = express.Router();
 
@@ -71,6 +72,25 @@ function lastAdminGuard(targetId, { demoting, deactivating }) {
   if (admins <= 1) throw httpError(400, 'Debe quedar al menos un administrador activo.');
 }
 
+/** Avisa en tiempo real a quienes tienen abierto el tablero. */
+function notify(req, boardId, event) {
+  realtime.publish(boardId, { ...event, by: req.user.id }, req.get('X-Client-Id'));
+}
+
+/** Registra un cambio en el historial de la tarjeta. */
+function logEvent(cardId, userId, type, data = {}) {
+  db.prepare('INSERT INTO card_events (card_id, user_id, type, data) VALUES (?, ?, ?, ?)')
+    .run(cardId, userId, type, JSON.stringify(data));
+}
+
+function columnName(id) {
+  return db.prepare('SELECT name FROM columns WHERE id = ?').get(id)?.name || '';
+}
+
+function userName(id) {
+  return id ? db.prepare('SELECT display_name FROM users WHERE id = ?').get(id)?.display_name || '' : null;
+}
+
 // ---------- usuarios ----------
 
 // Directorio para asignar tarjetas y agregar miembros (cualquier usuario autenticado).
@@ -91,19 +111,22 @@ router.post('/users', requireAdmin, (req, res) => {
   const display_name = text(req.body.display_name, { field: 'nombre', max: 100, required: true });
   const password = req.body.password;
   const role = req.body.role === 'admin' ? 'admin' : 'user';
+  const authSource = req.body.auth_source === 'ldap' ? 'ldap' : 'local';
 
   if (!/^[a-zA-Z0-9._-]{3,50}$/.test(username)) {
     throw httpError(400, 'El usuario solo puede tener letras, números, punto, guion y guion bajo (3 a 50).');
   }
-  if (typeof password !== 'string' || password.length < 8) {
+  if (authSource === 'local' && (typeof password !== 'string' || password.length < 8)) {
     throw httpError(400, 'La contraseña debe tener al menos 8 caracteres.');
   }
   if (db.prepare('SELECT 1 FROM users WHERE username = ?').get(username)) {
     throw httpError(409, `Ya existe el usuario "${username}".`);
   }
+  // Las cuentas de directorio no tienen contraseña local ('!' nunca coincide con un hash bcrypt).
+  const hash = authSource === 'local' ? bcrypt.hashSync(password, 12) : '!';
   const info = db.prepare(
-    'INSERT INTO users (username, display_name, password_hash, role) VALUES (?, ?, ?, ?)'
-  ).run(username, display_name, bcrypt.hashSync(password, 12), role);
+    'INSERT INTO users (username, display_name, password_hash, role, auth_source) VALUES (?, ?, ?, ?, ?)'
+  ).run(authSource === 'ldap' ? username.toLowerCase() : username, display_name, hash, role, authSource);
   const user = db.prepare('SELECT * FROM users WHERE id = ?').get(info.lastInsertRowid);
   res.status(201).json({ user: publicUser(user) });
 });
@@ -122,6 +145,9 @@ router.patch('/users/:id', requireAdmin, (req, res) => {
   if (active !== undefined && typeof active !== 'boolean') throw httpError(400, '"activo" no es válido.');
   if (password !== undefined && (typeof password !== 'string' || password.length < 8)) {
     throw httpError(400, 'La contraseña debe tener al menos 8 caracteres.');
+  }
+  if (password !== undefined && target.auth_source === 'ldap') {
+    throw httpError(400, 'Esta cuenta usa la contraseña de red; no se puede cambiar aquí.');
   }
 
   lastAdminGuard(id, {
@@ -189,7 +215,8 @@ router.get('/boards/:id', (req, res) => {
   const { board, role } = requireBoard(req.user, id, 'viewer');
   const columns = db.prepare('SELECT * FROM columns WHERE board_id = ? ORDER BY position, id').all(id);
   const cards = db.prepare(`
-    SELECT c.*, u.display_name AS assignee_name
+    SELECT c.*, u.display_name AS assignee_name,
+      (SELECT COUNT(*) FROM card_comments cc WHERE cc.card_id = c.id) AS comment_count
     FROM cards c LEFT JOIN users u ON u.id = c.assignee_id
     WHERE c.board_id = ? ORDER BY c.column_id, c.position, c.id`).all(id);
   const members = db.prepare(`
@@ -197,6 +224,12 @@ router.get('/boards/:id', (req, res) => {
     FROM board_members m JOIN users u ON u.id = m.user_id
     WHERE m.board_id = ? ORDER BY u.display_name COLLATE NOCASE`).all(id);
   res.json({ board, columns, cards, members, my_role: role });
+});
+
+router.get('/boards/:id/stream', (req, res) => {
+  const id = intParam(req.params.id, 'id');
+  requireBoard(req.user, id, 'viewer');
+  realtime.subscribe(req, res, id);
 });
 
 router.patch('/boards/:id', (req, res) => {
@@ -207,6 +240,7 @@ router.patch('/boards/:id', (req, res) => {
   if (req.body.name !== undefined && !name) throw httpError(400, 'El nombre no puede quedar vacío.');
   if (name) db.prepare('UPDATE boards SET name = ? WHERE id = ?').run(name, id);
   if (description !== undefined) db.prepare('UPDATE boards SET description = ? WHERE id = ?').run(description, id);
+  notify(req, id, { type: 'board' });
   res.json({ board: db.prepare('SELECT * FROM boards WHERE id = ?').get(id) });
 });
 
@@ -214,6 +248,7 @@ router.delete('/boards/:id', (req, res) => {
   const id = intParam(req.params.id, 'id');
   requireBoard(req.user, id, 'owner');
   db.prepare('DELETE FROM boards WHERE id = ?').run(id);
+  realtime.closeBoard(id, req.get('X-Client-Id'));
   res.status(204).end();
 });
 
@@ -236,6 +271,7 @@ router.put('/boards/:id/members/:userId', (req, res) => {
   db.prepare(`
     INSERT INTO board_members (board_id, user_id, role) VALUES (?, ?, ?)
     ON CONFLICT(board_id, user_id) DO UPDATE SET role = excluded.role`).run(id, userId, role);
+  notify(req, id, { type: 'members' });
   res.json({ ok: true });
 });
 
@@ -250,6 +286,7 @@ router.delete('/boards/:id/members/:userId', (req, res) => {
     if (owners <= 1) throw httpError(400, 'El tablero debe tener al menos un dueño.');
   }
   db.prepare('DELETE FROM board_members WHERE board_id = ? AND user_id = ?').run(id, userId);
+  notify(req, id, { type: 'members' }); // además corta el stream de quien fue quitado
   res.status(204).end();
 });
 
@@ -261,6 +298,7 @@ router.post('/boards/:id/columns', (req, res) => {
   const name = text(req.body.name, { field: 'nombre', max: 60, required: true });
   const pos = db.prepare('SELECT COALESCE(MAX(position), -1) + 1 AS p FROM columns WHERE board_id = ?').get(id).p;
   const info = db.prepare('INSERT INTO columns (board_id, name, position) VALUES (?, ?, ?)').run(id, name, pos);
+  notify(req, id, { type: 'columns' });
   res.status(201).json({ column: db.prepare('SELECT * FROM columns WHERE id = ?').get(info.lastInsertRowid) });
 });
 
@@ -274,6 +312,7 @@ router.post('/boards/:id/columns/reorder', (req, res) => {
   }
   const upd = db.prepare('UPDATE columns SET position = ? WHERE id = ?');
   db.transaction(() => ids.forEach((cid, i) => upd.run(i, cid)))();
+  notify(req, id, { type: 'columns' });
   res.json({ ok: true });
 });
 
@@ -290,6 +329,7 @@ router.patch('/columns/:id', (req, res) => {
     }
     db.prepare('UPDATE columns SET wip_limit = ? WHERE id = ?').run(w, col.id);
   }
+  notify(req, col.board_id, { type: 'columns' });
   res.json({ column: db.prepare('SELECT * FROM columns WHERE id = ?').get(col.id) });
 });
 
@@ -299,6 +339,7 @@ router.delete('/columns/:id', (req, res) => {
   const n = db.prepare('SELECT COUNT(*) AS n FROM cards WHERE column_id = ?').get(col.id).n;
   if (n > 0) throw httpError(409, 'Mueve o elimina las tarjetas de esta columna antes de borrarla.');
   db.prepare('DELETE FROM columns WHERE id = ?').run(col.id);
+  notify(req, col.board_id, { type: 'columns' });
   res.status(204).end();
 });
 
@@ -350,17 +391,32 @@ router.post('/columns/:id/cards', (req, res) => {
     col.board_id, col.id, f.title, f.description ?? '', f.color ?? '', f.due_date ?? null,
     f.assignee_id ?? null, pos, req.user.id
   );
-  res.status(201).json({ card: cardWithAssignee(info.lastInsertRowid) });
+  const cardId = info.lastInsertRowid;
+  logEvent(cardId, req.user.id, 'created', { column: col.name });
+  if (f.assignee_id) logEvent(cardId, req.user.id, 'assignee', { to: userName(f.assignee_id) });
+  notify(req, col.board_id, { type: 'card', card_id: cardId });
+  res.status(201).json({ card: cardWithAssignee(cardId) });
 });
 
 router.patch('/cards/:id', (req, res) => {
   const card = getCard(intParam(req.params.id, 'id'));
   requireBoard(req.user, card.board_id, 'editor');
   const f = cardFields(req.body);
-  const keys = Object.keys(f);
+  // Solo se guardan y registran los campos que realmente cambiaron.
+  const keys = Object.keys(f).filter((k) => (f[k] ?? null) !== (card[k] ?? null));
   if (keys.length) {
     const sets = keys.map((k) => `${k} = @${k}`).join(', ');
-    db.prepare(`UPDATE cards SET ${sets}, updated_at = datetime('now') WHERE id = @id`).run({ ...f, id: card.id });
+    db.transaction(() => {
+      db.prepare(`UPDATE cards SET ${sets}, updated_at = datetime('now') WHERE id = @id`).run({ ...f, id: card.id });
+      for (const k of keys) {
+        if (k === 'title') logEvent(card.id, req.user.id, 'title', { from: card.title, to: f.title });
+        if (k === 'description') logEvent(card.id, req.user.id, 'description');
+        if (k === 'color') logEvent(card.id, req.user.id, 'color', { to: f.color });
+        if (k === 'due_date') logEvent(card.id, req.user.id, 'due', { to: f.due_date });
+        if (k === 'assignee_id') logEvent(card.id, req.user.id, 'assignee', { to: userName(f.assignee_id) });
+      }
+    })();
+    notify(req, card.board_id, { type: 'card', card_id: card.id });
   }
   res.json({ card: cardWithAssignee(card.id) });
 });
@@ -388,6 +444,10 @@ router.post('/cards/:id/move', (req, res) => {
   const col = getColumn(toColumnId);
   if (col.board_id !== card.board_id) throw httpError(400, 'La columna destino es de otro tablero.');
   moveCard(card, toColumnId, toIndex);
+  if (toColumnId !== card.column_id) {
+    logEvent(card.id, req.user.id, 'moved', { from: columnName(card.column_id), to: col.name });
+  }
+  notify(req, card.board_id, { type: 'card', card_id: card.id });
   res.json({ card: cardWithAssignee(card.id) });
 });
 
@@ -395,6 +455,50 @@ router.delete('/cards/:id', (req, res) => {
   const card = getCard(intParam(req.params.id, 'id'));
   requireBoard(req.user, card.board_id, 'editor');
   db.prepare('DELETE FROM cards WHERE id = ?').run(card.id);
+  notify(req, card.board_id, { type: 'card', card_id: card.id });
+  res.status(204).end();
+});
+
+// ---------- comentarios e historial ----------
+
+router.get('/cards/:id/activity', (req, res) => {
+  const card = getCard(intParam(req.params.id, 'id'));
+  requireBoard(req.user, card.board_id, 'viewer');
+  const comments = db.prepare(`
+    SELECT c.id, c.user_id, c.body, c.created_at, u.display_name AS user_name
+    FROM card_comments c LEFT JOIN users u ON u.id = c.user_id
+    WHERE c.card_id = ? ORDER BY c.id`).all(card.id);
+  const events = db.prepare(`
+    SELECT e.id, e.user_id, e.type, e.data, e.created_at, u.display_name AS user_name
+    FROM card_events e LEFT JOIN users u ON u.id = e.user_id
+    WHERE e.card_id = ? ORDER BY e.id`).all(card.id)
+    .map((e) => ({ ...e, data: JSON.parse(e.data) }));
+  res.json({ comments, events });
+});
+
+// Los lectores también pueden comentar: participan sin poder mover ni editar tarjetas.
+router.post('/cards/:id/comments', (req, res) => {
+  const card = getCard(intParam(req.params.id, 'id'));
+  requireBoard(req.user, card.board_id, 'viewer');
+  const body = text(req.body.body, { field: 'comentario', max: 2000, required: true });
+  const info = db.prepare('INSERT INTO card_comments (card_id, user_id, body) VALUES (?, ?, ?)').run(card.id, req.user.id, body);
+  notify(req, card.board_id, { type: 'comment', card_id: card.id });
+  const comment = db.prepare(`
+    SELECT c.id, c.user_id, c.body, c.created_at, u.display_name AS user_name
+    FROM card_comments c LEFT JOIN users u ON u.id = c.user_id WHERE c.id = ?`).get(info.lastInsertRowid);
+  res.status(201).json({ comment });
+});
+
+router.delete('/comments/:id', (req, res) => {
+  const comment = db.prepare('SELECT * FROM card_comments WHERE id = ?').get(intParam(req.params.id, 'id'));
+  if (!comment) throw httpError(404, 'Comentario no encontrado.');
+  const card = getCard(comment.card_id);
+  const { role } = requireBoard(req.user, card.board_id, 'viewer');
+  if (comment.user_id !== req.user.id && role !== 'owner') {
+    throw httpError(403, 'Solo quien escribió el comentario o un dueño del tablero puede borrarlo.');
+  }
+  db.prepare('DELETE FROM card_comments WHERE id = ?').run(comment.id);
+  notify(req, card.board_id, { type: 'comment', card_id: card.id });
   res.status(204).end();
 });
 

@@ -268,3 +268,35 @@ td .row { flex-wrap: nowrap; }
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
 }
+
+/* ---------- utilidades ---------- */
+[hidden] { display: none !important; }
+
+/* ---------- indicador en vivo ---------- */
+.live { display: inline-flex; align-items: center; gap: .45em; font-size: .8rem; color: var(--muted); margin-right: .25rem; }
+.live::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--c-gray); }
+.live.on::before { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 25%, transparent); }
+.live.off { color: var(--warn); }
+.live.off::before { background: var(--warn); }
+
+/* ---------- comentarios en la tarjeta ---------- */
+.comment-count { display: inline-flex; align-items: center; gap: .3em; font-variant-numeric: tabular-nums; }
+.comment-count::before {
+  content: ""; width: 11px; height: 9px; border: 1.5px solid currentColor; border-radius: 3px 3px 3px 0;
+}
+
+/* ---------- actividad ---------- */
+.activity { border-top: 1px solid var(--line); padding-top: 1rem; margin-top: .25rem; display: flex; flex-direction: column; gap: .75rem; }
+.comment-box { display: flex; flex-direction: column; gap: .4rem; }
+.comment-box textarea { min-height: 3.6em; }
+.hint { font-size: .8rem; }
+.feed { display: flex; flex-direction: column; gap: .55rem; }
+.comment { background: var(--bg); border-radius: 8px; padding: .6rem .75rem; display: flex; flex-direction: column; gap: .35rem; }
+.comment-head { display: flex; align-items: center; gap: .5rem; font-size: .9rem; }
+.comment-head .avatar { width: 22px; height: 22px; font-size: .65rem; }
+.comment-head time { color: var(--muted); font-size: .8rem; }
+.comment-head .btn { margin-left: auto; }
+.comment-body { white-space: pre-wrap; overflow-wrap: anywhere; }
+.event { display: flex; gap: .75rem; justify-content: space-between; font-size: .85rem; color: var(--muted); padding: 0 .75rem; }
+.event b { color: var(--ink); font-weight: 600; }
+.event time { flex: none; }

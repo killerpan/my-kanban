@@ -1,7 +1,7 @@
 services:
   kanban:
     build: .
-    image: kanban-intranet:1.0.0
+    image: kanban-intranet:1.1.0
     container_name: kanban
     restart: unless-stopped
     env_file: .env
